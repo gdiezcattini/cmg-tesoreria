@@ -45,15 +45,15 @@ const CMG_LOGO = "data:image/png;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BS
 // ─────────────────────────────────────────────
 // INITIAL DATA
 // ─────────────────────────────────────────────
-const INITIAL_MEMBERS = [
-  { id: 1, nombre: "Dr. Alejandro Martínez García", email: "amartinez@example.com", tipo: "activo", password: "1234", adeudos: { 2019: false, 2020: true, 2021: false, 2022: true, 2023: false, 2024: true, 2025: false }, notas: "" },
-  { id: 2, nombre: "Dra. Carmen López Vega", email: "clopez@example.com", tipo: "activo", password: "1234", adeudos: { 2019: true, 2020: true, 2021: true, 2022: true, 2023: true, 2024: true, 2025: true }, notas: "" },
-  { id: 3, nombre: "Dr. Roberto Sánchez Díaz", email: "rsanchez@example.com", tipo: "activo", password: "1234", adeudos: { 2019: false, 2020: true, 2021: true, 2022: true, 2023: true, 2024: true, 2025: true }, notas: "Acordó pagar en dos exhibiciones" },
-  { id: 4, nombre: "Dra. Patricia Flores Ruiz", email: "pflores@example.com", tipo: "emérito", password: "1234", adeudos: {}, notas: "" },
-  { id: 5, nombre: "Dr. Eduardo Herrera Mendoza", email: "eherrera@example.com", tipo: "fundador", password: "1234", adeudos: {}, notas: "" },
-  { id: 6, nombre: "Dra. Sofía Torres Castillo", email: "storres@example.com", tipo: "activo", password: "1234", adeudos: { 2019: true, 2020: true, 2021: true, 2022: true, 2023: true, 2024: true, 2025: false }, notas: "" },
-  { id: 7, nombre: "Dr. Miguel Ángel Ramírez", email: "mramirez@example.com", tipo: "activo", password: "1234", adeudos: { 2019: true, 2020: true, 2021: true, 2022: true, 2023: true, 2024: false, 2025: false }, notas: "" },
-];
+// UUID generator for new members
+function genUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+const INITIAL_MEMBERS = [];
 
 const INITIAL_ANUALIDADES = { 2019: 2500, 2020: 2500, 2021: 2800, 2022: 2800, 2023: 3000, 2024: 3000, 2025: 3000 };
 const INITIAL_PAGOS_2026 = {};
@@ -327,13 +327,18 @@ export default function App() {
   }, []);
 
   const saveMembers = useCallback(async d => {
-    setMembers(d);
+    // Ensure all members have valid UUIDs
+    const normalized = d.map(m => ({
+      ...m,
+      id: (typeof m.id === 'string' && m.id.includes('-')) ? m.id : genUUID(),
+    }));
+    setMembers(normalized);
     // Sync to Supabase
     try {
-      for (const m of d) {
-        await db.upsertSocio({ id: m.id, nombre: m.nombre, email: m.email, tipo: m.tipo, password: m.password, activo: m.activo, notas: m.notas });
+      for (const m of normalized) {
+        await db.upsertSocio({ id: m.id, nombre: m.nombre, email: m.email || null, tipo: m.tipo, password: m.password, activo: m.activo !== false, notas: m.notas || null });
       }
-    } catch(e) { console.error("saveMembers Supabase error", e); await saveData("cmg_members_v2", d); }
+    } catch(e) { console.error("saveMembers Supabase error", e); }
   }, []);
   const saveAnualidades = useCallback(async d => { setAnualidades(d); await saveData("cmg_anualidades", d); }, []);
   const savePagos = useCallback(async d => {
@@ -1057,7 +1062,7 @@ function AdminView({ members, anualidades, settings, saveMembers, saveAnualidade
     await addAudit({ fecha: new Date().toISOString(), accion: "Socio eliminado", socio: m.nombre, detalle: "Socio eliminado del sistema." });
   };
   const addMember = async () => {
-    const id = Math.max(...members.map(m => m.id), 0) + 1;
+    const id = genUUID();
     const m = { ...newM, id };
     await saveMembers([...members, m]);
     await addAudit({ fecha: new Date().toISOString(), accion: "Socio agregado", socio: m.nombre, detalle: `Nuevo socio tipo ${m.tipo} agregado.` });
@@ -1072,9 +1077,8 @@ function AdminView({ members, anualidades, settings, saveMembers, saveAnualidade
       const wb = XLSX.read(ev.target.result, { type: "binary" });
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws);
-      const maxId = Math.max(...members.map(m => m.id), 0);
       const imported = rows.map((r, i) => ({
-        id: maxId + i + 1,
+        id: genUUID(),
         nombre: r.nombre || r.Nombre || "",
         email: r.email || r.Correo || "",
         tipo: (r.tipo || r.Tipo || "activo").toLowerCase(),
