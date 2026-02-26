@@ -28,7 +28,7 @@ const db = {
   getSocios: () => sbFetch("/socios?select=*,cuotas(*)&order=nombre"),
   upsertSocio: (socio) => sbFetch("/socios", { method: "POST", prefer: "resolution=merge-duplicates,return=representation", body: JSON.stringify(socio) }),
   deleteSocio: (id) => sbFetch(`/socios?id=eq.${id}`, { method: "DELETE", prefer: "" }),
-  upsertCuota: (cuota) => sbFetch("/cuotas", { method: "POST", prefer: "resolution=merge-duplicates,return=representation", body: JSON.stringify(cuota) }),
+  upsertCuota: (cuota) => sbFetch("/cuotas?on_conflict=socio_id,anio", { method: "POST", prefer: "resolution=merge-duplicates,return=representation", body: JSON.stringify(cuota) }),
   getPagos: () => sbFetch("/pagos?select=*&order=fecha.desc"),
   insertPago: (pago) => sbFetch("/pagos", { method: "POST", body: JSON.stringify(pago) }),
   updatePago: (id, data) => sbFetch(`/pagos?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(data) }),
@@ -69,11 +69,13 @@ const INITIAL_SETTINGS = {
 // ─────────────────────────────────────────────
 // UTILS
 // ─────────────────────────────────────────────
-function getCuota2026() {
+function getCuota2026(tipo) {
+  const base = tipo === "ago" ? 1500 : 3000;
+  const recargo = tipo === "ago" ? 0 : 500;
   const m = new Date().getMonth() + 1;
-  if (m <= 3) return 3000;
-  if (m <= 6) return 3500;
-  return 4000;
+  if (m <= 3) return base;
+  if (m <= 6) return base + recargo;
+  return base + recargo * 2;
 }
 function getPeriodo2026() {
   const m = new Date().getMonth() + 1;
@@ -91,7 +93,7 @@ function calcDeudaTotal(member, anualidades, pagos2026, settings) {
   let total = 0;
   Object.entries(member.adeudos || {}).forEach(([yr, pagado]) => { if (!pagado) total += getCuotaYear(parseInt(yr), anualidades, settings); });
   const p = pagos2026[member.id];
-  if (!p || p.status !== "verificado") total += getCuota2026();
+  if (!p || p.status !== "verificado") total += getCuota2026(member.tipo);
   return total;
 }
 function calcDeudaPrevios(member, anualidades, settings) {
@@ -381,7 +383,7 @@ export default function App() {
           : <MainLayout session={session} onLogout={() => setSession(null)}>
               {session.role === "tesorero" && <TesoreroView {...shared} />}
               {session.role === "admin" && <AdminView {...shared} />}
-              {session.role === "miembro" && <MiembroView {...shared} member={members.find(m => m.id === session.memberId)} />}
+              {session.role === "miembro" && <MiembroView {...shared} member={members.find(m => String(m.id) === String(session.memberId))} />}
             </MainLayout>}
       </div>
     </>
@@ -423,7 +425,7 @@ function LoginView({ members, setSession }) {
   const go = (fn) => { setErr(""); fn(); };
   const loginTesorero = () => { if (pw === "tesorero2026") setSession({ role: "tesorero" }); else setErr("Contraseña incorrecta"); };
   const loginMiembro = () => {
-    const m = members.find(x => x.id === parseInt(memberId));
+    const m = members.find(x => String(x.id) === String(memberId));
     if (!m) { setErr("Socio no encontrado"); return; }
     if (m.password !== pw) { setErr("Contraseña incorrecta"); return; }
     setSession({ role: "miembro", memberId: m.id, memberName: m.nombre });
@@ -517,7 +519,8 @@ function MiembroView({ member, members, anualidades, pagos2026, settings, saveMe
 
   if (!member) return <div className="alert a-red">Error: socio no encontrado</div>;
   const esExento = member.tipo === "emérito" || member.tipo === "fundador";
-  const cuota = getCuota2026();
+  const esAGO = member.tipo === "ago";
+  const cuota = getCuota2026(member?.tipo);
   const pago = pagos2026[member.id];
   const deudaTotal = calcDeudaTotal(member, anualidades, pagos2026, settings);
   const deudaPrev = esExento ? [] : Object.entries(member.adeudos || {}).filter(([, v]) => !v);
@@ -669,27 +672,33 @@ function TesoreroView({ members, anualidades, pagos2026, settings, audit, saveMe
   const [editNota, setEditNota] = useState(null); // { id, notas }
   const [notaVal, setNotaVal] = useState("");
 
-  const cuota = getCuota2026();
-  const activos = members.filter(m => m.tipo === "activo");
+  const cuota = getCuota2026("activo");
+  const activos = members.filter(m => m.tipo === "activo" || m.tipo === "ago");
   const total = activos.length;
   const alCorriente = activos.filter(m => calcDeudaTotal(m, anualidades, pagos2026, settings) === 0).length;
   const conDeuda = activos.filter(m => calcDeudaTotal(m, anualidades, pagos2026, settings) > 0).length;
   const avisados = Object.values(pagos2026).filter(p => p.status === "avisado").length;
   const totalEsperado = activos.reduce((s, m) => s + calcDeudaTotal(m, anualidades, pagos2026, settings) + (pagos2026[m.id]?.status === "verificado" ? cuota : 0), 0);
-  const recaudado = activos.filter(m => pagos2026[m.id]?.status === "verificado").length * cuota;
+  const recaudado = activos.filter(m => pagos2026[m.id]?.status === "verificado").reduce((s, m) => s + getCuota2026(m.tipo), 0);
   const pctCorriente = total > 0 ? Math.round((alCorriente / total) * 100) : 0;
+
+  // Extract apellido paterno for sorting (skip Dr./Dra. prefix)
+  const apellido = (nombre) => {
+    const parts = nombre.replace(/^(Dr\.?|Dra\.?)\s+/i, '').trim().split(/\s+/);
+    return parts.length >= 2 ? parts[parts.length - 2].toLowerCase() : parts[0].toLowerCase();
+  };
 
   const filtered = members.filter(m => {
     const nm = m.nombre.toLowerCase().includes(search.toLowerCase());
     if (!nm) return false;
-    if (m.tipo !== "activo") return filterEstado === "todos";
+    if (m.tipo !== "activo" && m.tipo !== "ago") return filterEstado === "todos";
     const deuda = calcDeudaTotal(m, anualidades, pagos2026, settings);
     const pago = pagos2026[m.id];
     if (filterEstado === "al-corriente") return deuda === 0;
     if (filterEstado === "con-adeudo") return deuda > 0 && pago?.status !== "avisado";
     if (filterEstado === "verificar") return pago?.status === "avisado";
     return true;
-  });
+  }).sort((a, b) => apellido(a.nombre).localeCompare(apellido(b.nombre), 'es'));
 
   const verificarPago = async (m) => {
     const updated = { ...pagos2026, [m.id]: { status: "verificado", fecha: new Date().toISOString() } };
@@ -706,9 +715,9 @@ function TesoreroView({ members, anualidades, pagos2026, settings, audit, saveMe
         "Nombre": m.nombre,
         "Correo": m.email,
         "Tipo": m.tipo,
-        "Adeudos años anteriores": m.tipo === "activo" ? (deudaPrevArr || "Ninguno") : "N/A",
+        "Adeudos años anteriores": (m.tipo === "activo" || m.tipo === "ago") ? (deudaPrevArr || "Ninguno") : "N/A",
         "Estado 2026": pago?.status === "verificado" ? "Verificado" : pago?.status === "avisado" ? "Avisado - pendiente verificar" : "Pendiente",
-        "Total a pagar 2026": m.tipo === "activo" ? deuda : 0,
+        "Total a pagar 2026": (m.tipo === "activo" || m.tipo === "ago") ? deuda : 0,
         "Notas": m.notas || "",
       };
     });
@@ -730,7 +739,7 @@ function TesoreroView({ members, anualidades, pagos2026, settings, audit, saveMe
       <div className="row jb mb3" style={{ flexWrap: "wrap", gap: "1rem" }}>
         <div>
           <h2 style={{ fontFamily: "DM Serif Display,serif", fontSize: "1.8rem", color: "var(--navy)" }}>Panel del Tesorero</h2>
-          <p className="muted">Cuota vigente 2026: <strong>{fmt(cuota)}</strong> · {getPeriodo2026()}</p>
+          <p className="muted">Cuota vigente 2026: <strong>{fmt(getCuota2026("activo"))}</strong> · AGO: <strong>{fmt(getCuota2026("ago"))}</strong> · {getPeriodo2026()}</p>
         </div>
         <div className="row" style={{ gap: ".5rem" }}>
           <button className="btn btn-ghost btn-sm" onClick={exportExcel}>📥 Exportar Excel</button>
@@ -767,7 +776,7 @@ function TesoreroView({ members, anualidades, pagos2026, settings, audit, saveMe
 
           <div className="mlist">
             {filtered.map(m => {
-              const esExento = m.tipo !== "activo";
+              const esExento = m.tipo === "emérito" || m.tipo === "fundador";
               const deuda = calcDeudaTotal(m, anualidades, pagos2026, settings);
               const pago = pagos2026[m.id];
               const isNotified = pago?.status === "avisado";
@@ -844,7 +853,7 @@ function TesoreroView({ members, anualidades, pagos2026, settings, audit, saveMe
 // DASHBOARD TAB
 // ─────────────────────────────────────────────
 function DashboardTab({ members, anualidades, pagos2026, settings, cuota }) {
-  const activos = members.filter(m => m.tipo === "activo");
+  const activos = members.filter(m => m.tipo === "activo" || m.tipo === "ago");
   const verificados = activos.filter(m => pagos2026[m.id]?.status === "verificado").length;
   const avisados = activos.filter(m => pagos2026[m.id]?.status === "avisado").length;
   const pendientes = activos.length - verificados - avisados;
@@ -862,7 +871,7 @@ function DashboardTab({ members, anualidades, pagos2026, settings, cuota }) {
     return s + d;
   }, 0))) * 100) : 0;
 
-  const totalEsperadoAnio = activos.length * cuota;
+  const totalEsperadoAnio = activos.reduce((s, m) => s + getCuota2026(m.tipo), 0);
 
   return (
     <>
@@ -947,7 +956,7 @@ function BarChart({ data, total }) {
 // COBRANZA TAB
 // ─────────────────────────────────────────────
 function CobranzaTab({ members, anualidades, pagos2026, settings, cuota }) {
-  const activos = members.filter(m => m.tipo === "activo");
+  const activos = members.filter(m => m.tipo === "activo" || m.tipo === "ago");
   const soloDeuda2026 = activos.filter(m => !tieneAdeudosPrevios(m) && (pagos2026[m.id]?.status !== "verificado"));
   const conPrevios = activos.filter(m => tieneAdeudosPrevios(m));
   const riesgoBaja = activos.filter(m => countAnualidadesAdeudo(m, pagos2026) >= 3);
@@ -1052,9 +1061,10 @@ function AdminView({ members, anualidades, settings, saveMembers, saveAnualidade
   const YEARS = [2019, 2020, 2021, 2022, 2023, 2024, 2025];
 
   const saveEdit = async () => {
-    await saveMembers(members.map(m => m.id === editM.id ? { ...editM } : m));
+    const updated = members.map(m => m.id === editM.id ? { ...editM } : m);
+    setEditM(null); // close modal immediately
+    await saveMembers(updated);
     await addAudit({ fecha: new Date().toISOString(), accion: "Socio editado", socio: editM.nombre, detalle: "Información del socio actualizada por el administrador." });
-    setEditM(null);
   };
   const delM = async (m) => {
     if (!confirm(`¿Eliminar a ${m.nombre}?`)) return;
@@ -1217,14 +1227,14 @@ function AdminView({ members, anualidades, settings, saveMembers, saveAnualidade
 
       {/* Edit Modal */}
       {editM && (
-        <div className="modal-bg" onClick={() => setEditM(null)}>
-          <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-bg" onMouseDown={e => { if (e.target === e.currentTarget) setEditM(null); }}>
+          <div className="modal" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-title">✏️ Editar Socio</div>
             <div className="fg"><label>Nombre</label><input value={editM.nombre} onChange={e => setEditM({ ...editM, nombre: e.target.value })} /></div>
             <div className="fg"><label>Correo</label><input type="email" value={editM.email} onChange={e => setEditM({ ...editM, email: e.target.value })} /></div>
             <div className="fg"><label>Tipo</label>
               <select value={editM.tipo} onChange={e => setEditM({ ...editM, tipo: e.target.value })}>
-                <option value="activo">Activo</option><option value="emérito">Emérito</option><option value="fundador">Fundador</option>
+                <option value="activo">Activo</option><option value="ago">Miembro AGO</option><option value="emérito">Emérito</option><option value="fundador">Fundador</option>
               </select>
             </div>
             <div className="fg"><label>Contraseña</label><input value={editM.password} onChange={e => setEditM({ ...editM, password: e.target.value })} /></div>
@@ -1254,14 +1264,14 @@ function AdminView({ members, anualidades, settings, saveMembers, saveAnualidade
 
       {/* Add Modal */}
       {showAdd && (
-        <div className="modal-bg" onClick={() => setShowAdd(false)}>
+        <div className="modal-bg" onMouseDown={e => { if (e.target === e.currentTarget) setShowAdd(false); }}>
           <div className="modal" onClick={e => e.stopPropagation()}>
             <div className="modal-title">+ Agregar Socio</div>
             <div className="fg"><label>Nombre Completo</label><input value={newM.nombre} onChange={e => setNewM({ ...newM, nombre: e.target.value })} placeholder="Dr. Nombre Apellido" /></div>
             <div className="fg"><label>Correo</label><input type="email" value={newM.email} onChange={e => setNewM({ ...newM, email: e.target.value })} /></div>
             <div className="fg"><label>Tipo</label>
               <select value={newM.tipo} onChange={e => setNewM({ ...newM, tipo: e.target.value })}>
-                <option value="activo">Activo</option><option value="emérito">Emérito</option><option value="fundador">Fundador</option>
+                <option value="activo">Activo</option><option value="ago">Miembro AGO</option><option value="emérito">Emérito</option><option value="fundador">Fundador</option>
               </select>
             </div>
             <div className="fg"><label>Contraseña Inicial</label><input value={newM.password} onChange={e => setNewM({ ...newM, password: e.target.value })} /></div>
