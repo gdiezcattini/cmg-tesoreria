@@ -26,9 +26,23 @@ const sbFetch = async (path, options = {}) => {
 
 const db = {
   getSocios: () => sbFetch("/socios?select=*,cuotas(*)&order=nombre"),
-  upsertSocio: (socio) => sbFetch("/socios", { method: "POST", prefer: "resolution=merge-duplicates,return=representation", body: JSON.stringify(socio) }),
+  upsertSocio: async (socio) => {
+    // Try PATCH first (update existing), then POST (insert new)
+    try {
+      const res = await sbFetch(`/socios?id=eq.${socio.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(socio) });
+      if (res && res.length > 0) return res;
+    } catch(e) {}
+    return sbFetch("/socios", { method: "POST", prefer: "return=representation", body: JSON.stringify(socio) });
+  },
   deleteSocio: (id) => sbFetch(`/socios?id=eq.${id}`, { method: "DELETE", prefer: "" }),
-  upsertCuota: (cuota) => sbFetch("/cuotas?on_conflict=socio_id,anio", { method: "POST", prefer: "resolution=merge-duplicates,return=representation", body: JSON.stringify(cuota) }),
+  upsertCuota: async (cuota) => {
+    // Try PATCH first (update existing), then POST (insert new)
+    try {
+      const res = await sbFetch(`/cuotas?socio_id=eq.${cuota.socio_id}&anio=eq.${cuota.anio}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(cuota) });
+      if (res && res.length > 0) return res;
+    } catch(e) {}
+    return sbFetch("/cuotas", { method: "POST", prefer: "return=representation", body: JSON.stringify(cuota) });
+  },
   getPagos: () => sbFetch("/pagos?select=*&order=fecha.desc"),
   insertPago: (pago) => sbFetch("/pagos", { method: "POST", body: JSON.stringify(pago) }),
   updatePago: (id, data) => sbFetch(`/pagos?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(data) }),
@@ -344,7 +358,7 @@ export default function App() {
   }, []);
   const saveAnualidades = useCallback(async d => { setAnualidades(d); await saveData("cmg_anualidades", d); }, []);
   const savePagos = useCallback(async d => {
-    setPagos2026(d);
+    setPagos2026(d); // update UI immediately
     // Sync cuotas to Supabase
     try {
       for (const [socioId, pago] of Object.entries(d)) {
